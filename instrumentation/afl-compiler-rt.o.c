@@ -1077,12 +1077,16 @@ static void __afl_start_snapshots(void) {
 
 static void __afl_start_forkserver(void) {
 
+  /* HM: make sure ForkServer is only started ONCE */
   if (__afl_already_initialized_forkserver) return;
   __afl_already_initialized_forkserver = 1;
 
+  /* HM: store original SIGTERM handler for child process to restore later */
   struct sigaction orig_action;
   sigaction(SIGTERM, NULL, &orig_action);
   old_sigterm_handler = orig_action.sa_handler;
+  /* HM: set new handler `at_exit` so when afl-fuzz terminates ForkServer, it kills
+      the running child and exits cleanly (no child process orphan) */
   signal(SIGTERM, at_exit);
 
 #ifdef __linux__
@@ -1096,15 +1100,25 @@ static void __afl_start_forkserver(void) {
 
 #endif
 
+  /* HM: `tmp` - 4-byte buffer for outbound handshake */
   u8  tmp[4] = {0, 0, 0, 0};
   u32 status_for_fsrv = 0;
+
+  /* HM: `already_read_first` - flag: if we already consumed first message during
+   *   handshake, do not try to read it again on first loop iteration */
   u32 already_read_first = 0;
+
+  /* HM: `was_killed` - used for initial response from fuzzer and inside main loop:
+   *  was the previous child killed by the fuzzer?  */
   u32 was_killed;
 
+  /* HM: `child_stopped` - flag to track whether current child is paused (persistent mode)
+   *  or needs to be re-forked. */
   u8 child_stopped = 0;
 
   void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
 
+  /* HM: capability flags for extended capabilities */
   if (__afl_map_size <= FS_OPT_MAX_MAPSIZE) {
 
     status_for_fsrv |= (FS_OPT_SET_MAPSIZE(__afl_map_size) | FS_OPT_MAPSIZE);
@@ -1124,17 +1138,29 @@ static void __afl_start_forkserver(void) {
 
   }
 
+  /* HM: `status_for_fsrv` is bit map of capabilities set. Copy to `tmp`, the
+      4-byte buffer for the outbound handshake. */
   memcpy(tmp, &status_for_fsrv, 4);
 
   /* Phone home and tell the parent that we're OK. If parent isn't there,
      assume we're not running in forkserver mode and just execute program. */
 
+  /* HM: HANDSHAKE STEP 1: write 4 bytes to FD 199 (write ForkServer -> fuzzer)
+      from `tmp`. If write fails, then silently return (running outside afl-fuzz).
+      Makes binaries runnable standalone. If write succeeds, set `__afl_connected`
+      flag to 1. */
   if (write(FORKSRV_FD + 1, tmp, 4) != 4) { return; }
 
+  /* HM: `__afl_connected` - flag that ForkServer is running */
   __afl_connected = 1;
 
+  /* HM: response from fuzzer depends on features enabled. If shared memory or
+      autodict enabled, expect fuzzer to reply confirming which features enabled. */
   if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary)) {
 
+    /* HM: HANDSHAKE STEP 2: block until 4 bytes are read from
+      `FORKSRV_FD` (read fuzzer -> ForkServer) and copy bytes to `was_killed`.
+      Fail/exit if not 4 bytes read. */
     if (read(FORKSRV_FD, &was_killed, 4) != 4) _exit(1);
 
     if (__afl_debug) {
@@ -1143,6 +1169,7 @@ static void __afl_start_forkserver(void) {
 
     }
 
+    /* HM: if fuzzer indicates, attach input shared-memory segment */
     if ((was_killed & (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ)) ==
         (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ)) {
 
@@ -1150,6 +1177,8 @@ static void __afl_start_forkserver(void) {
 
     }
 
+    /* HM: if fuzzer indicates, send AUTODICT dictionary (first 4-byte length,
+        then the dictionary bytes in write loop) */
     if ((was_killed & (FS_OPT_ENABLED | FS_OPT_AUTODICT)) ==
             (FS_OPT_ENABLED | FS_OPT_AUTODICT) &&
         __afl_dictionary_len && __afl_dictionary) {
@@ -1184,6 +1213,9 @@ static void __afl_start_forkserver(void) {
       }
 
     } else {
+      /* HM: legacy fuzzers that do not understand extended options. Then the
+          read to `was_killed` was the first message (go signal) not options ACK,
+          so set `already_read_first` flag to 1. */
 
       // uh this forkserver does not understand extended option passing
       // or does not want the dictionary
@@ -1192,7 +1224,9 @@ static void __afl_start_forkserver(void) {
     }
 
   }
+  /* HM: HANDSHAKE COMPLETE */
 
+  /* HM: main ForkSever loop */
   while (1) {
 
     int status;
@@ -1205,6 +1239,8 @@ static void __afl_start_forkserver(void) {
 
     } else {
 
+      /* HM: block to read 4 bytes from fuzzer that indicate whether previous
+          child was killed. If error or pipe closed, _exit(1) to clean up. */
       if (read(FORKSRV_FD, &was_killed, 4) != 4) {
 
         // write_error("read from afl-fuzz");
@@ -1214,6 +1250,7 @@ static void __afl_start_forkserver(void) {
 
     }
 
+/* HM: debug build flag */
 #ifdef _AFL_DOCUMENT_MUTATIONS
     if (__afl_fuzz_ptr) {
 
@@ -1240,6 +1277,7 @@ static void __afl_start_forkserver(void) {
 
 #endif
 
+    /* HM: persistent mode (ignore) */
     /* If we stopped the child in persistent mode, but there was a race
        condition and afl-fuzz already issued SIGKILL, write off the old
        process. */
@@ -1256,12 +1294,15 @@ static void __afl_start_forkserver(void) {
 
     }
 
+    /* HM: Fork! `!child_stopped` --> not persistent mode */
     if (!child_stopped) {
 
       /* Once woken up, create a clone of our process. */
 
+      /* HM: Fork the grandchild (child) process to actually fuzz */
       child_pid = fork();
       if (child_pid < 0) {
+        /* HM: error when forking child */
 
         write_error("fork");
         _exit(1);
@@ -1271,19 +1312,24 @@ static void __afl_start_forkserver(void) {
       /* In child process: close fds, resume execution. */
 
       if (!child_pid) {
+        /* HM: child process -- newly forked process to actually fuzz */
 
         //(void)nice(-20);
 
+        /* HM: In child process, restore signal handlers */
         signal(SIGCHLD, old_sigchld_handler);
         signal(SIGTERM, old_sigterm_handler);
 
+        /* HM: In child process, close pipes for fuzzer <--> ForkServer */
         close(FORKSRV_FD);
         close(FORKSRV_FD + 1);
+        /* HM: child process returns out of function to resume normal execution */
         return;
 
       }
 
     } else {
+      /* HM: Persistent mode (ignore!) */
 
       /* Special handling for persistent mode: if the child is alive but
          currently stopped, simply restart it with SIGCONT. */
@@ -1293,8 +1339,11 @@ static void __afl_start_forkserver(void) {
 
     }
 
+    /* HM: child process returned, so this code is executed by parent (ForkServer) */
+
     /* In parent process: write PID to pipe, then wait for child. */
 
+    /* HM: ForkServer report child PID to fuzzer */
     if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) {
 
       write_error("write to afl-fuzz");
@@ -1302,6 +1351,8 @@ static void __afl_start_forkserver(void) {
 
     }
 
+    /* HM: ForkServer waits for child process to finish. `WUNTRACED` for
+        persistent mode (ignore). */
     if (waitpid(child_pid, &status, is_persistent ? WUNTRACED : 0) < 0) {
 
       write_error("waitpid");
@@ -1317,6 +1368,8 @@ static void __afl_start_forkserver(void) {
 
     /* Relay wait status to pipe, then loop back. */
 
+    /* HM: ForkServer child is done, now send wait status back to fuzzer.
+        While loop continues back to top (ForkServer waits for next go signal). */
     if (write(FORKSRV_FD + 1, &status, 4) != 4) {
 
       write_error("writing to afl-fuzz");
@@ -1325,6 +1378,7 @@ static void __afl_start_forkserver(void) {
     }
 
   }
+  /* HM: end of while block (main ForkServer loop) */
 
 }
 
