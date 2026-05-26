@@ -109,6 +109,10 @@ u32 __afl_dictionary_len;
 u64 __afl_map_addr;
 u32 __afl_first_final_loc;
 
+/* HM: adding option FS_OPT_STDOUT */
+static int df_stdout_capture_enabled = 0;
+static u8 *df_stdout_buf = NULL;
+
 #ifdef __AFL_CODE_COVERAGE
 typedef struct afl_module_info_t afl_module_info_t;
 
@@ -1116,7 +1120,14 @@ static void __afl_start_forkserver(void) {
    *  or needs to be re-forked. */
   u8 child_stopped = 0;
 
+  /* HM: add local variables for stdout capture */
+  int stdout_pipe[2] = {-1, -1};
+  u32 captured_len = 0;
+
   void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
+
+  /* HM: add FS_OPT_STDOUT capability */
+  status_for_fsrv |= FS_OPT_STDOUT;
 
   /* HM: capability flags for extended capabilities */
   if (__afl_map_size <= FS_OPT_MAX_MAPSIZE) {
@@ -1156,7 +1167,9 @@ static void __afl_start_forkserver(void) {
 
   /* HM: response from fuzzer depends on features enabled. If shared memory or
       autodict enabled, expect fuzzer to reply confirming which features enabled. */
-  if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary)) {
+  /* HM: update if condition to also check if FS_OPT_STDOUT is enabled */
+  if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary)
+      || (status_for_fsrv & FS_OPT_STDOUT) ) {
 
     /* HM: HANDSHAKE STEP 2: block until 4 bytes are read from
       `FORKSRV_FD` (read fuzzer -> ForkServer) and copy bytes to `was_killed`.
@@ -1166,6 +1179,19 @@ static void __afl_start_forkserver(void) {
     if (__afl_debug) {
 
       fprintf(stderr, "DEBUG: target forkserver recv: %08x\n", was_killed);
+
+    }
+
+    /* HM: add check for enabling stdout capture */
+    if ((was_killed & (FS_OPT_ENABLED | FS_OPT_STDOUT)) ==
+        (FS_OPT_ENABLED | FS_OPT_STDOUT)) {
+
+      df_stdout_capture_enabled = 1;
+      df_stdout_buf = (u8 *)malloc(DF_STDOUT_CAP);
+      if (!df_stdout_buf) {
+        write_error("alloc stdout capture buffer");
+        _exit(1);
+      }
 
     }
 
@@ -1299,6 +1325,15 @@ static void __afl_start_forkserver(void) {
 
       /* Once woken up, create a clone of our process. */
 
+      /* HM: add per-child fork if stdout capture is enabled */
+      if (df_stdout_capture_enabled) {
+        if (pipe(stdout_pipe) < 0) {
+          write_error("stdout pipe");
+          _exit(1);
+        }
+        fcntl(stdout_pipe[0], F_SETPIPE_SZ, DF_STDOUT_CAP);
+      }
+
       /* HM: Fork the grandchild (child) process to actually fuzz */
       child_pid = fork();
       if (child_pid < 0) {
@@ -1323,6 +1358,15 @@ static void __afl_start_forkserver(void) {
         /* HM: In child process, close pipes for fuzzer <--> ForkServer */
         close(FORKSRV_FD);
         close(FORKSRV_FD + 1);
+
+        /* HM: add pipe handling for stdout pipe */
+        if (df_stdout_capture_enabled) {
+          dup2(stdout_pipe[1], STDOUT_FILENO);
+          close(stdout_pipe[0]);
+          close(stdout_pipe[1]);
+          setvbuf(stdout, NULL, _IOLBF, 0);
+        }
+
         /* HM: child process returns out of function to resume normal execution */
         return;
 
@@ -1342,6 +1386,12 @@ static void __afl_start_forkserver(void) {
     /* HM: child process returned, so this code is executed by parent (ForkServer) */
 
     /* In parent process: write PID to pipe, then wait for child. */
+
+    /* HM: parent immediately closes stdout capture pipe write end */
+    if (df_stdout_capture_enabled) {
+      close(stdout_pipe[1]);
+      stdout_pipe[1] = -1;
+    }
 
     /* HM: ForkServer report child PID to fuzzer */
     if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) {
@@ -1368,12 +1418,48 @@ static void __afl_start_forkserver(void) {
 
     /* Relay wait status to pipe, then loop back. */
 
+    /* HM: before writing wait status, add capture of stdout bytes from target */
+    if (df_stdout_capture_enabled) {
+      captured_len = 0;
+      while (captured_len < DF_STDOUT_CAP) {
+        ssize_t n = read(stdout_pipe[0],
+                        df_stdout_buf + captured_len,
+                        DF_STDOUT_CAP - captured_len);
+        if (n > 0) { captured_len += (u32)n; continue }
+        if (n < 0 && errno == EINTR) continue;
+        break; /* EOF or unexpected error; bail with what we have */
+      }
+      close(stdout_pipe[0]);
+      stdout_pipe[0] = -1;
+    }
+
     /* HM: ForkServer child is done, now send wait status back to fuzzer.
         While loop continues back to top (ForkServer waits for next go signal). */
     if (write(FORKSRV_FD + 1, &status, 4) != 4) {
 
       write_error("writing to afl-fuzz");
       _exit(1);
+
+    }
+
+    /* HM: after writing wait status, also write stdout bytes */
+    if (df_stdout_capture_enabled) {
+
+        /* write length of stdout bytes to fuzzer */
+        if (write(FORKSRV_FD + 1, &captured_len, 4) != 4) {
+          write_error("writing stdout len to fuzzer");
+          _exit(1);
+        }
+
+        /* write actual stdout bytes to fuzzer */
+        u32 off = 0;
+        while (off < captured_len) {
+          ssize_t n = write(FORKSRV_FD + 1, df_stdout_buf + off, captured_len - off);
+          if (n > 0) { off += (u32)n; continue; }
+          if (n < 0 && errno == EINTR) continue;
+          write_error("writing stdout to fuzzer");
+          _exit(1);
+        }
 
     }
 

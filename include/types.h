@@ -63,6 +63,12 @@ typedef uint128_t         u128;
 #define FS_OPT_SET_MAPSIZE(x) \
   (x <= 1 || x > FS_OPT_MAX_MAPSIZE ? 0 : ((x - 1) << 1))
 
+/* HM: adding FS_OPT for stdout capture */
+/* HM: free bit for enabling stdout capture */
+#define FS_OPT_STDOUT 0x00001000
+/* HM: max size for stdout pipe buffer, 1MiB matches F_SETPIPE_SZ */
+#define DF_STDOUT_CAP (1u << 20)
+
 typedef unsigned long long u64;
 
 typedef int8_t  s8;
