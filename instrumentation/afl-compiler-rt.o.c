@@ -77,6 +77,12 @@
   #endif
 #endif
 
+/* HM: Define F_SETPIPE_SZ so runtime compiles regardless of _GNU_SOURCE
+    Value matches linux/fcntl.h. */
+#ifndef F_SETPIPE_SZ
+  #define F_SETPIPE_SZ 1031
+#endif
+
 #define CTOR_PRIO 3
 #define EARLY_FS_PRIO 5
 
@@ -1425,7 +1431,7 @@ static void __afl_start_forkserver(void) {
         ssize_t n = read(stdout_pipe[0],
                         df_stdout_buf + captured_len,
                         DF_STDOUT_CAP - captured_len);
-        if (n > 0) { captured_len += (u32)n; continue }
+        if (n > 0) { captured_len += (u32)n; continue; }
         if (n < 0 && errno == EINTR) continue;
         break; /* EOF or unexpected error; bail with what we have */
       }
