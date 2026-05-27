@@ -1250,13 +1250,14 @@ static void __afl_start_forkserver(void) {
           Fuzzer response is "go signal" to ForkServer, so set `already_read_first`
           to start first loop iteration.
 
-          UPDATE: still wait for explicit go signal after handshaking from fuzzer
-          when FS_OPT_STDOUT is used to ensure input is written to input file before
-          forking target. Prevents race condition where stale input may be read. */
+          UPDATE: must wait for explicit go signal after handshaking from fuzzer
+          when FS_OPT_STDOUT is available to ensure input is written to input file
+          before forking target. Prevents race condition where stale input may be
+          read and corrupt differential fuzzer comparisons. */
 
       // uh this forkserver does not understand extended option passing
       // or does not want the dictionary
-      if (!__afl_fuzz_ptr && !df_stdout_capture_enabled) already_read_first = 1;
+      if (!__afl_fuzz_ptr && !(status_for_fsrv & FS_OPT_STDOUT)) already_read_first = 1;
 
     }
 
