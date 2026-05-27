@@ -65,7 +65,7 @@ typedef uint128_t         u128;
 
 /* HM: adding FS_OPT for stdout capture */
 /* HM: free bit for enabling stdout capture */
-#define FS_OPT_STDOUT 0x00001000
+#define FS_OPT_STDOUT 0x04000000
 /* HM: max size for stdout pipe buffer, 1MiB matches F_SETPIPE_SZ */
 #define DF_STDOUT_CAP (1u << 20)
 
